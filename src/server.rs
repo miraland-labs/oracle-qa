@@ -16,6 +16,7 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 pub struct AppState {
     pub config: OracleConfig,
     pub stats: RwLock<OracleStats>,
+    pub started_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -78,7 +79,8 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let stats = state.stats.read().await.clone();
+    let mut stats = state.stats.read().await.clone();
+    stats.uptime_seconds = state.started_at.elapsed().as_secs();
     Json(stats)
 }
 

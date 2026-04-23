@@ -51,6 +51,10 @@ The **first official oracle** for the x402 SLA-Escrow ecosystem.
   - Minimum body length (if specified)
 4. **Settler** builds and signs a `ConfirmOracle` transaction with the verdict (Approved/Rejected) and submits it to the chain.
 
+## Formal specification (shared SLA rules)
+
+Interoperability requires a **published profile**, not ad-hoc JSON per seller. See **[`spec/README.md`](spec/README.md)** — profile **`x402/oracle-qa/api-quality/v1`** with a normative document, JSON Schemas, and examples under [`spec/api-quality-v1/`](spec/api-quality-v1/NORMATIVE.md).
+
 ## SLA Document Format
 
 ```json
@@ -70,7 +74,7 @@ The **first official oracle** for the x402 SLA-Escrow ecosystem.
 }
 ```
 
-The on-chain `sla_hash` = `SHA256(canonical_json(sla_document))`.
+The on-chain `sla_hash` = `SHA256(raw_bytes)` where **raw_bytes** are the exact file bytes you upload to the evidence registry (see [Evidence Registry](#evidence-registry)). Same rule for `delivery_hash`.
 
 ## Delivery Evidence Format
 
@@ -84,7 +88,7 @@ The on-chain `sla_hash` = `SHA256(canonical_json(sla_document))`.
 }
 ```
 
-The on-chain `delivery_hash` = `SHA256(canonical_json(delivery_evidence))`.
+Use the **same byte sequence** for hashing that the registry will return on `GET` (typically UTF-8 JSON file bytes, minified or pretty—must be identical).
 
 ## Quick Start
 
@@ -126,12 +130,15 @@ The oracle fetches SLA documents and delivery evidence from an off-chain registr
 GET {EVIDENCE_REGISTRY_URL}/{sha256_hex_hash}
 ```
 
-The registry must return the JSON document whose SHA256 matches the requested hash. This can be:
+The response **body bytes** must satisfy `SHA256(body) ==` the 32-byte hash committed on-chain (oracle verifies **raw bytes** before parsing JSON). Parties should:
 
-- A simple key-value HTTP server
-- IPFS gateway (with hash-to-CID mapping)
-- Arweave gateway
-- Any content-addressable storage
+1. **Agree** on a JSON schema for SLA + evidence (this repo documents example shapes).
+2. **Compute** `sha256` over the **exact** file bytes to be hosted.
+3. **Upload** those bytes to the registry at the path above.
+
+Suitable backends: nginx `alias` of static files named by hash, S3 object keyed by hash, IPFS (content id matches hash only when CID is raw-leaf compatible—use a pinning flow that checks the hash), or a small internal service.
+
+**Three-party read access:** The registry must be **readable by the oracle** (HTTP GET). Buyers and sellers usually obtain the same URLs **out-of-band** (embedded in your marketplace API, x402 `resource` metadata, or a shared manifest). The chain only stores **hashes**—not URLs—so document where humans/agents fetch the full payload.
 
 ## HTTP API
 

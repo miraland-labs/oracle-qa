@@ -10,6 +10,7 @@ mod types;
 use config::OracleConfig;
 use server::{AppState, OracleStats};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
@@ -40,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         config: config.clone(),
         stats: RwLock::new(OracleStats::default()),
+        started_at: Instant::now(),
     });
 
     // Job channel: chain monitor -> evaluation worker

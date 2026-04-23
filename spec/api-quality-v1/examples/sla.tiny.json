@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "endpoint": "https://api.example.com/v1/ping",
+  "method": "GET"
+}

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "x402/oracle-qa/api-quality/v1/sla-document",
+  "title": "SLA document (API Quality v1)",
+  "description": "Normative JSON shape for sla_hash commitment; must match oracle-qa SlaDocument deserialization.",
+  "type": "object",
+  "additionalProperties": true,
+  "description": "Core keys are evaluated; additional keys are ignored by oracle-qa v1 (serde forward-compat).",
+  "required": ["version", "endpoint", "method"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Profile major version; v1 for x402/oracle-qa/api-quality/v1."
+    },
+    "endpoint": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Declarative URI for the agreed API resource (oracle does not replay HTTP in v1)."
+    },
+    "method": {
+      "type": "string",
+      "minLength": 1,
+      "description": "HTTP method (e.g. GET, POST)."
+    },
+    "response_schema": {
+      "description": "Optional JSON Schema for response_body in delivery evidence.",
+      "type": ["object", "boolean"]
+    },
+    "required_fields": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "default": []
+    },
+    "max_latency_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 5000
+    },
+    "min_status_code": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 599,
+      "default": 200
+    },
+    "max_status_code": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 599,
+      "default": 299
+    },
+    "min_body_length": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Minimum UTF-8 length of JSON.stringify(response_body) in evidence."
+    }
+  }
+}

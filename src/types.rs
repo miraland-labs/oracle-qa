@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Off-chain SLA document that defines the quality contract.
-/// SHA256(canonical_json(SlaDocument)) == payment.sla_hash
+/// `payment.sla_hash` MUST equal SHA256(UTF-8 octets of the SLA JSON); see `spec/api-quality-v1/NORMATIVE.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaDocument {
     pub version: u32,
@@ -32,7 +32,7 @@ fn default_max_status() -> u16 {
 }
 
 /// Off-chain delivery evidence submitted by the seller.
-/// SHA256(canonical_json(DeliveryEvidence)) == payment.delivery_hash
+/// `payment.delivery_hash` MUST equal SHA256(UTF-8 octets of the evidence JSON); see `spec/api-quality-v1/NORMATIVE.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryEvidence {
     pub status_code: u16,

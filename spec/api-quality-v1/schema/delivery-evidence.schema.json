@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "x402/oracle-qa/api-quality/v1/delivery-evidence",
+  "title": "Delivery evidence (API Quality v1)",
+  "description": "Normative JSON shape for delivery_hash commitment; must match oracle-qa DeliveryEvidence deserialization.",
+  "type": "object",
+  "additionalProperties": true,
+  "description": "Core keys are evaluated; additional keys are ignored by oracle-qa v1.",
+  "required": ["status_code", "latency_ms", "response_body", "timestamp"],
+  "properties": {
+    "status_code": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 599
+    },
+    "latency_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "response_body": {
+      "description": "Parsed JSON value (object, array, string, number, boolean, or null)."
+    },
+    "response_headers": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Optional; not used in core v1 checks."
+    },
+    "timestamp": {
+      "type": "integer",
+      "description": "Unix epoch seconds (informative)."
+    }
+  }
+}

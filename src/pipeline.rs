@@ -9,15 +9,20 @@ use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 /// Fetch an off-chain document by its SHA256 hash from the evidence registry.
+///
+/// **Integrity:** The registry MUST return the **exact bytes** whose SHA256 is `hash`
+/// (same bytes the seller/buyer hashed when committing `sla_hash` / `delivery_hash` on-chain).
+/// We verify `SHA256(raw_response_body) == hash` *before* JSON parsing, so integrators are not
+/// tied to `serde_json` re-serialization (which is not a stable canonical form).
 async fn fetch_evidence<T: serde::de::DeserializeOwned>(
     registry_url: &str,
     hash: &[u8; 32],
     parse_error: fn(String) -> OracleError,
 ) -> Result<T, OracleError> {
     let hash_hex = hex::encode(hash);
-    let url = format!("{}/{}", registry_url, hash_hex);
+    let url = format!("{}/{}", registry_url.trim_end_matches('/'), hash_hex);
 
-    let response = reqwest::get(url).await?;
+    let response = reqwest::get(&url).await?;
     if !response.status().is_success() {
         return Err(OracleError::EvidenceNotFound(format!(
             "Registry returned {} for hash {}",
@@ -26,19 +31,17 @@ async fn fetch_evidence<T: serde::de::DeserializeOwned>(
         )));
     }
 
-    let body: serde_json::Value = response.json().await?;
-
-    let canonical = serde_json::to_string(&body).unwrap_or_default();
-    let computed = Sha256::digest(canonical.as_bytes());
+    let raw = response.bytes().await?;
+    let computed = Sha256::digest(&raw);
     if computed.as_slice() != hash {
         return Err(OracleError::EvidenceNotFound(format!(
-            "Hash mismatch: expected {}, got {}",
+            "Hash mismatch for {}: document bytes do not match on-chain hash (got {})",
             hash_hex,
             hex::encode(computed)
         )));
     }
 
-    serde_json::from_value(body).map_err(|e| parse_error(format!("Failed to parse: {}", e)))
+    serde_json::from_slice(&raw).map_err(|e| parse_error(format!("Failed to parse JSON: {}", e)))
 }
 
 /// Execute the full evaluation pipeline for a single job:
