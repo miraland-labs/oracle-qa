@@ -55,3 +55,12 @@ Bind `BIND_ADDR=127.0.0.1:4020` and expose **HTTPS** with nginx or Caddy in fron
 - Oracle keypair funded with SOL on the target cluster for `ConfirmOracle` fees.
 - `EVIDENCE_REGISTRY_URL` reachable from the VPS (same region reduces latency).
 - `ESCROW_PROGRAM_ID` matches the deployment buyers/sellers use with pr402.
+
+## 5. pr402 buyer/facilitator alignment (SLA-Escrow)
+
+When buyers use **[pr402](https://github.com/miralandlabs/pr402)** to fund escrows this oracle resolves:
+
+- **`paymentRequirements.accepted.extra`** (and the mirrored proof) should include **`beneficiary`** or **`merchantWallet`** so verify/build can encode **`FundPayment.seller`** correctly.
+- **`facilitatorPaysTransactionFees: true`** on **`POST /api/v1/facilitator/build-sla-escrow-payment-tx`** is rejected unless the facilitator sets **`PR402_SLA_ESCROW_ALLOW_FACILITATOR_FEE_SPONSORSHIP`** (default off); omit the flag for buyer-paid Solana fees.
+- **Payment mint allowlist:** pr402 enforces **`PR402_ALLOWED_PAYMENT_MINTS`** on SLA-Escrow **`/verify`**, **`/settle`**, and **`build-sla-escrow-payment-tx`** (same as **`exact`**). Ensure seller **`accepts[].asset`** and test escrows use an allowlisted SPL mint, or buyers fail before this oracle runs.
+- **Agent discovery:** facilitators advertise **`/agent-payTo-semantics.json`** via **`GET /api/v1/facilitator/capabilities`** (`agentManifest.payToSemantics`) for `payTo` / mint-policy hints.
