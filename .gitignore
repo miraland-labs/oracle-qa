@@ -1,4 +1,7 @@
-/target
+# Local secrets
 .env
-*.swp
-*.swo
+.env.*
+!.env.example
+
+/target
+*.log
