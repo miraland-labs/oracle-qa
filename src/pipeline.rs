@@ -5,43 +5,93 @@ use crate::{
     settler,
     types::{DeliveryEvidence, EvaluationJob, EvaluationResult, SlaDocument},
 };
+use reqwest::header::{HeaderMap, AUTHORIZATION};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use tracing::{error, info, warn};
 
-/// Fetch an off-chain document by its SHA256 hash from the evidence registry.
-///
-/// **Integrity:** The registry MUST return the **exact bytes** whose SHA256 is `hash`
-/// (same bytes the seller/buyer hashed when committing `sla_hash` / `delivery_hash` on-chain).
-/// We verify `SHA256(raw_response_body) == hash` *before* JSON parsing, so integrators are not
-/// tied to `serde_json` re-serialization (which is not a stable canonical form).
+/// Fetch raw bytes from registry mirrors with retry/backoff; verify SHA256 before parsing JSON.
 async fn fetch_evidence<T: serde::de::DeserializeOwned>(
-    registry_url: &str,
+    config: &OracleConfig,
     hash: &[u8; 32],
     parse_error: fn(String) -> OracleError,
 ) -> Result<T, OracleError> {
     let hash_hex = hex::encode(hash);
-    let url = format!("{}/{}", registry_url.trim_end_matches('/'), hash_hex);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| OracleError::EvidenceNotFound(e.to_string()))?;
 
-    let response = reqwest::get(&url).await?;
-    if !response.status().is_success() {
-        return Err(OracleError::EvidenceNotFound(format!(
-            "Registry returned {} for hash {}",
-            response.status(),
-            hash_hex
-        )));
+    let mut headers = HeaderMap::new();
+    if let Some(auth) = &config.evidence_registry_auth_header {
+        let h = AUTHORIZATION;
+        headers.insert(
+            h,
+            auth.parse()
+                .map_err(|e: reqwest::header::InvalidHeaderValue| {
+                    OracleError::EvidenceNotFound(format!("invalid AUTH header: {}", e))
+                })?,
+        );
     }
 
-    let raw = response.bytes().await?;
-    let computed = Sha256::digest(&raw);
-    if computed.as_slice() != hash {
-        return Err(OracleError::EvidenceNotFound(format!(
-            "Hash mismatch for {}: document bytes do not match on-chain hash (got {})",
-            hash_hex,
-            hex::encode(computed)
-        )));
+    let mut last_err = String::new();
+    for base in &config.evidence_registry_urls {
+        let url = format!("{}/{}", base.trim_end_matches('/'), hash_hex);
+        for attempt in 0..config.evidence_fetch_max_retries {
+            let req = client.get(&url).headers(headers.clone());
+            match req.send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        last_err = format!("Registry returned {} for {}", response.status(), url);
+                        if response.status().is_server_error()
+                            && attempt + 1 < config.evidence_fetch_max_retries
+                        {
+                            tokio::time::sleep(Duration::from_millis(
+                                config.evidence_fetch_retry_base_ms * (1 << attempt),
+                            ))
+                            .await;
+                            continue;
+                        }
+                        break;
+                    }
+                    match response.bytes().await {
+                        Ok(raw) => {
+                            let computed = Sha256::digest(&raw);
+                            if computed.as_slice() != hash {
+                                return Err(OracleError::EvidenceNotFound(format!(
+                                    "Hash mismatch for {}: document bytes do not match on-chain hash (got {})",
+                                    hash_hex,
+                                    hex::encode(computed)
+                                )));
+                            }
+                            return serde_json::from_slice(&raw)
+                                .map_err(|e| parse_error(format!("Failed to parse JSON: {}", e)));
+                        }
+                        Err(e) => {
+                            last_err = format!("read body: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+            if attempt + 1 < config.evidence_fetch_max_retries {
+                tokio::time::sleep(Duration::from_millis(
+                    config.evidence_fetch_retry_base_ms * (1 << attempt),
+                ))
+                .await;
+            }
+        }
     }
 
-    serde_json::from_slice(&raw).map_err(|e| parse_error(format!("Failed to parse JSON: {}", e)))
+    Err(OracleError::EvidenceNotFound(format!(
+        "{} (tried {} base URL(s), up to {} retries each): {}",
+        hash_hex,
+        config.evidence_registry_urls.len(),
+        config.evidence_fetch_max_retries,
+        last_err
+    )))
 }
 
 /// Execute the full evaluation pipeline for a single job:
@@ -65,27 +115,20 @@ pub async fn run_pipeline(
     }
 
     // Step 2: Fetch SLA document and delivery evidence
-    let sla: SlaDocument = fetch_evidence(
-        &config.evidence_registry_url,
-        &job.sla_hash,
-        OracleError::SlaParse,
-    )
-    .await
-    .map_err(|e| {
-        warn!("Failed to fetch SLA for {}: {}", uid_hex, e);
-        e
-    })?;
+    let sla: SlaDocument = fetch_evidence(config, &job.sla_hash, OracleError::SlaParse)
+        .await
+        .map_err(|e| {
+            warn!("Failed to fetch SLA for {}: {}", uid_hex, e);
+            e
+        })?;
 
-    let evidence: DeliveryEvidence = fetch_evidence(
-        &config.evidence_registry_url,
-        &job.delivery_hash,
-        OracleError::DeliveryParse,
-    )
-    .await
-    .map_err(|e| {
-        warn!("Failed to fetch delivery evidence for {}: {}", uid_hex, e);
-        e
-    })?;
+    let evidence: DeliveryEvidence =
+        fetch_evidence(config, &job.delivery_hash, OracleError::DeliveryParse)
+            .await
+            .map_err(|e| {
+                warn!("Failed to fetch delivery evidence for {}: {}", uid_hex, e);
+                e
+            })?;
 
     info!(
         "Evaluating payment {}: endpoint={}, latency={}ms, status={}",

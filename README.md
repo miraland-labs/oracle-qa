@@ -41,7 +41,7 @@ The **first official oracle** for the x402 SLA-Escrow ecosystem.
 
 ## How It Works
 
-1. **Chain Monitor** subscribes to SLA-Escrow program logs via Solana WebSocket (`logsSubscribe`). When a `DeliverySubmittedEvent` is detected, it reads the payment PDA to build an evaluation job.
+1. **Chain Monitor** subscribes to SLA-Escrow program logs via Solana WebSocket (`logsSubscribe`). When a **`DeliverySubmittedEvent`** is detected (parsed from **program data** / transaction metadata where available), it derives the **payment PDA** and builds an evaluation job; duplicate **`payment_uid`** values are ignored while a job is in flight (see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)).
 2. **Pipeline** fetches the SLA document and delivery evidence from an off-chain registry (keyed by SHA256 hash), verifies hash integrity, then runs the evaluator.
 3. **Evaluator** checks the delivery against SLA requirements:
   - HTTP status code within range
@@ -53,13 +53,26 @@ The **first official oracle** for the x402 SLA-Escrow ecosystem.
 
 ## Formal specification (shared SLA rules)
 
-Interoperability requires a **published profile**, not ad-hoc JSON per seller. See **[`spec/README.md`](spec/README.md)** — profile **`x402/oracle-qa/api-quality/v1`** with a normative document, JSON Schemas, and examples under [`spec/api-quality-v1/`](spec/api-quality-v1/NORMATIVE.md).
+Interoperability requires a **published profile**, not ad-hoc JSON per seller. See **[`spec/README.md`](spec/README.md)** — profile **`x402/oracle-qa/api-quality/v1`** with a normative document, JSON Schemas, and examples under [`spec/api-quality-v1/`](spec/api-quality-v1/NORMATIVE.md). SLAs may include optional **`profile_id`** so the wrong oracle binary cannot silently apply the wrong rule set (evaluator rejects a mismatch).
+
+### Trust model (bootstrap default oracle)
+
+This oracle implements **hash-bound SLA compliance on seller-attested delivery snapshots**: on-chain commits bind **`SHA256(SLA bytes)`** and **`SHA256(delivery bytes)`**; evaluation checks whether the **fetched** delivery JSON satisfies the **fetched** SLA rules (status, latency, schema, fields, length). **Integrity of committed bytes** is cryptographic; **truth of the underlying HTTP call** is **not** proven unless you add attestations, reputation, monitoring, or a stronger profile (see [`spec/signed-delivery-v2/DRAFT.md`](spec/signed-delivery-v2/DRAFT.md)).
+
+### When not to use oracle-qa (as the sole arbiter)
+
+- **High-value or adversarial counterparties** where forged off-chain JSON is a material risk without extra controls.
+- **Regulated or third-party attestations** that must bind delivery to a specific TLS session or independent witness.
+- **Domain semantics** beyond JSON shape and declared metrics (use a **domain oracle** or fork the evaluator).
+
+In those cases, treat this deployment as a **reference / bootstrap** and operate a purpose-built oracle or add verification tiers per the spec drafts.
 
 ## SLA Document Format
 
 ```json
 {
   "version": 1,
+  "profile_id": "x402/oracle-qa/api-quality/v1",
   "endpoint": "https://api.example.com/v1/data",
   "method": "GET",
   "response_schema": {
@@ -101,7 +114,7 @@ solana airdrop 2 $(solana-keygen pubkey ~/.config/solana/oracle-keypair.json) --
 
 # 3. Configure
 cp .env.example .env
-# Edit .env: set ORACLE_KEYPAIR_PATH, ESCROW_PROGRAM_ID, EVIDENCE_REGISTRY_URL
+# Edit .env: set ORACLE_KEYPAIR_PATH, ESCROW_PROGRAM_ID, EVIDENCE_REGISTRY_URL (or EVIDENCE_REGISTRY_URLS)
 
 # 4. Run
 cargo run --release
@@ -118,17 +131,23 @@ cargo run --release
 | `ESCROW_PROGRAM_ID`     | Program default                 | SLA-Escrow program ID                  |
 | `BIND_ADDR`             | `127.0.0.1:4020`                | HTTP server bind address               |
 | `EVALUATION_TIMEOUT_MS` | `30000`                         | Max evaluation time per job            |
-| `EVIDENCE_REGISTRY_URL` | `http://localhost:4021`         | Base URL for fetching evidence by hash |
+| `EVIDENCE_REGISTRY_URL` | `http://localhost:4021`       | Single registry base URL (legacy; used when `EVIDENCE_REGISTRY_URLS` is unset) |
+| `EVIDENCE_REGISTRY_URLS` | *(unset)*                    | Comma-separated mirror base URLs; tried **in order** per artifact; first **hash-valid** response wins |
+| `EVIDENCE_REGISTRY_AUTH_HEADER` | *(unset)*             | Optional `Authorization` header value on registry GET (e.g. `Bearer …`) |
+| `EVIDENCE_FETCH_MAX_RETRIES` | `3`                      | Per-URL retries for transient HTTP failures (still fail closed on hash mismatch) |
+| `EVIDENCE_FETCH_RETRY_BASE_MS` | `200`                  | Exponential backoff base delay            |
 | `RUST_LOG`              | `oracle_qa=info`                | Log level filter                       |
 
 
 ## Evidence Registry
 
-The oracle fetches SLA documents and delivery evidence from an off-chain registry at:
+The oracle fetches SLA documents and delivery evidence from an off-chain registry. With one base URL:
 
 ```
 GET {EVIDENCE_REGISTRY_URL}/{sha256_hex_hash}
 ```
+
+With **`EVIDENCE_REGISTRY_URLS`**, the same path is tried against each base URL in order until a response’s **raw body** hashes to the committed value.
 
 The response **body bytes** must satisfy `SHA256(body) ==` the 32-byte hash committed on-chain (oracle verifies **raw bytes** before parsing JSON). Parties should:
 

@@ -9,6 +9,7 @@ This directory holds **published, versioned rule families** for the reference or
 - **Normative** — enough precision that two independent implementations can agree on pass/fail for the same inputs.
 - **Minimal** — no vocabulary beyond what evaluation requires; resist turning the SLA into a general-purpose policy language.
 - **Hash-committed** — the on-chain `sla_hash` / `delivery_hash` bind **exact off-chain octets** (see each profile’s *Normative* document).
+- **Profile binding (optional)** — SLAs may include **`profile_id`** matching the oracle’s rule family so deployments do not silently evaluate under the wrong semantics.
 
 ## Profiles
 

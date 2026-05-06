@@ -2697,6 +2697,7 @@ dependencies = [
  "solana-pubsub-client",
  "solana-sdk",
  "solana-transaction-status",
+ "solana-transaction-status-client-types",
  "spl-associated-token-account 7.0.0",
  "spl-token 4.0.2",
  "thiserror 2.0.18",

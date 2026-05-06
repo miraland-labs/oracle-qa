@@ -53,8 +53,15 @@ Bind `BIND_ADDR=127.0.0.1:4020` and expose **HTTPS** with nginx or Caddy in fron
 ## 4. Operational checklist
 
 - Oracle keypair funded with SOL on the target cluster for `ConfirmOracle` fees.
-- `EVIDENCE_REGISTRY_URL` reachable from the VPS (same region reduces latency).
+- **Evidence registry:** `EVIDENCE_REGISTRY_URL` or **`EVIDENCE_REGISTRY_URLS`** reachable from the VPS (same region reduces latency). Mirrors let you survive a single host outage; the oracle verifies **SHA-256(raw body)** before parsing JSON. Optional **`EVIDENCE_REGISTRY_AUTH_HEADER`** if the registry is not public read.
+- **`EVIDENCE_FETCH_MAX_RETRIES`** / **`EVIDENCE_FETCH_RETRY_BASE_MS`** for transient 5xx or timeouts (still **fail closed** on hash mismatch).
 - `ESCROW_PROGRAM_ID` matches the deployment buyers/sellers use with pr402.
+
+### Chain worker behavior
+
+- **Event-driven jobs:** The worker subscribes to program logs and decodes **`DeliverySubmittedEvent`** (program data / parsed instructions) to find the **payment PDA** where possible, with a fallback scan of transaction account keys if parsing is incomplete.
+- **Dedupe:** While an evaluation is running for a given on-chain **`payment_uid`**, duplicate log lines for the same UID are skipped (the UID is released if the pipeline errors or times out so a later retry can run).
+- **Single-writer expectation:** Running **two** oracle operator instances with the **same** keypair against the same payments can race `ConfirmOracle` and waste fees; use one primary worker or shard by program/deploy.
 
 ## 5. pr402 buyer/facilitator alignment (SLA-Escrow)
 
@@ -64,4 +71,5 @@ When buyers use **[pr402](https://github.com/miralandlabs/pr402)** to fund escro
 - **`facilitatorPaysTransactionFees: true`** on **`POST /api/v1/facilitator/build-sla-escrow-payment-tx`** is rejected unless the facilitator sets **`PR402_SLA_ESCROW_ALLOW_FACILITATOR_FEE_SPONSORSHIP`** (default off); omit the flag for buyer-paid Solana fees.
 - **Payment mint allowlist:** pr402 enforces **`PR402_ALLOWED_PAYMENT_MINTS`** on SLA-Escrow **`/verify`**, **`/settle`**, and **`build-sla-escrow-payment-tx`** (same as **`exact`**). Ensure seller **`accepts[].asset`** and test escrows use an allowlisted SPL mint, or buyers fail before this oracle runs.
 - **Agent discovery:** facilitators advertise **`/agent-payTo-semantics.json`** via **`GET /api/v1/facilitator/capabilities`** (`agentManifest.payToSemantics`) for `payTo` / mint-policy hints.
+- **Default oracle hints:** the same **`/capabilities`** response may include **`slaEscrowOracleQa`** (profile id **`x402/oracle-qa/api-quality/v1`**, spec URL, optional advertised **`oracle_authority`** pubkey). Fund escrows with the **`oracle_authority`** you trust; do not rely on defaults without verification.
 - **Scheme on proofs:** pr402 **`verifyBodyTemplate`** uses wire **`exact`** / **`sla-escrow`** in `scheme` fields; **`POST /verify`** / **`/settle`** also accept `v2:solana:*` aliases and normalize.

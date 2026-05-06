@@ -1,6 +1,8 @@
 use crate::{
     error::OracleError,
-    types::{CheckResult, DeliveryEvidence, EvaluationResult, SlaDocument},
+    types::{
+        CheckResult, DeliveryEvidence, EvaluationResult, SlaDocument, API_QUALITY_V1_PROFILE_ID,
+    },
 };
 
 pub struct Evaluator;
@@ -12,6 +14,19 @@ impl Evaluator {
         evidence: &DeliveryEvidence,
     ) -> Result<EvaluationResult, OracleError> {
         let mut checks = Vec::new();
+
+        if let Some(pid) = &sla.profile_id {
+            let ok = pid == API_QUALITY_V1_PROFILE_ID;
+            checks.push(CheckResult {
+                name: "profile_id".into(),
+                passed: ok,
+                detail: if ok {
+                    API_QUALITY_V1_PROFILE_ID.into()
+                } else {
+                    format!("expected '{}', got '{}'", API_QUALITY_V1_PROFILE_ID, pid)
+                },
+            });
+        }
 
         // Check 1: HTTP status code range
         let status_ok = evidence.status_code >= sla.min_status_code
@@ -102,6 +117,7 @@ impl Evaluator {
                 .iter()
                 .find(|c| !c.passed)
                 .map(|c| match c.name.as_str() {
+                    "profile_id" => ResolutionReason::GeneralRejection,
                     "status_code" => ResolutionReason::StatusCodeOutOfRange,
                     "latency" => ResolutionReason::LatencyExceeded,
                     "json_schema" => ResolutionReason::SchemaValidationFailed,

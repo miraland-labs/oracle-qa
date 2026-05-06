@@ -2,10 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "x402/oracle-qa/api-quality/v1/sla-document",
   "title": "SLA document (API Quality v1)",
-  "description": "Normative JSON shape for sla_hash commitment; must match oracle-qa SlaDocument deserialization.",
+  "description": "Normative JSON shape for sla_hash commitment; must match oracle-qa SlaDocument deserialization. Core keys are evaluated; additional keys are ignored by oracle-qa v1 (serde forward-compat).",
   "type": "object",
   "additionalProperties": true,
-  "description": "Core keys are evaluated; additional keys are ignored by oracle-qa v1 (serde forward-compat).",
   "required": ["version", "endpoint", "method"],
   "properties": {
     "version": {
@@ -22,6 +21,11 @@
       "type": "string",
       "minLength": 1,
       "description": "HTTP method (e.g. GET, POST)."
+    },
+    "profile_id": {
+      "type": "string",
+      "const": "x402/oracle-qa/api-quality/v1",
+      "description": "When set, MUST be this value for v1; mismatches are rejected by the evaluator."
     },
     "response_schema": {
       "description": "Optional JSON Schema for response_body in delivery evidence.",

@@ -32,6 +32,19 @@ This document is **normative** for artifacts evaluated by `oracle-qa` at profile
 | **Raw commitment**    | The exact octet sequence hashed; **no** implied canonicalization beyond stable UTF-8 encoding of the JSON text. |
 | **Profile**           | A versioned rule family (`x402/oracle-qa/api-quality/v1`); version `1` matches schema major version below.      |
 
+### 2.1 Trust assumptions and threat model (informative but operationally binding)
+
+The reference oracle implements **hash-bound SLA compliance on seller-attested delivery snapshots**:
+
+- On-chain commitments (`sla_hash`, `delivery_hash`) bind the **exact UTF-8 octets** of the SLA JSON and delivery JSON. The oracle verifies `SHA256(bytes)` before parsing.
+- The evaluator checks whether the **parsed delivery object** satisfies the **parsed SLA rules**. It **does not** open network connections to `endpoint` or replay HTTP (`endpoint` / `method` are declarative for audit, routing, and human review).
+- **Truth of the underlying HTTP exchange** is **out of scope** for this profile: a dishonest seller could **fabricate** `status_code`, `latency_ms`, and `response_body` in the delivery JSON unless deterred by reputation, legal agreement, monitoring, or a future profile (e.g. seller-signed commitments, independent replay, or third-party attestation).
+
+**When this profile is appropriate:** bootstrap and experimentation; trusted or low-stakes counterparties; amounts small relative to abuse cost.
+
+**When to migrate:** high-value escrows, adversarial sellers, or regulated attestations require a **domain-specific oracle** or a **stronger profile** (see draft `signed-delivery` work in [`../signed-delivery-v2/DRAFT.md`](../signed-delivery-v2/DRAFT.md)).
+
+**Dispute paths:** operators may use `POST /evaluate` for manual re-run after fixing infra; governance may rotate `oracle_authority` on-chain; parties may choose a different oracle for new payments.
 
 ---
 
@@ -59,6 +72,7 @@ The SLA document MUST validate against `[schema/sla-document.schema.json](schema
 | Field                                | Role                                                                                                                                                                                                                                           |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `version`                            | **MUST** be `1` for this profile. Future profile revisions may increment.                                                                                                                                                                      |
+| `profile_id`                         | **OPTIONAL.** If present, **MUST** be exactly `x402/oracle-qa/api-quality/v1`. If absent, the implementation treats the document as v1 by convention (backward compatibility). A **wrong** `profile_id` SHALL cause evaluation to **fail** before other checks. |
 | `endpoint`, `method`                 | **Declarative** metadata: which resource the parties intend (URI string, HTTP verb). This reference oracle **does not** replay HTTP requests; it evaluates **delivery evidence** only. These fields support audit, dispute, and agent routing. |
 | `min_status_code`, `max_status_code` | Inclusive bounds; evidence `status_code` MUST lie in `[min_status_code, max_status_code]`.                                                                                                                                                     |
 | `max_latency_ms`                     | Upper bound on reported latency; evidence `latency_ms` MUST NOT exceed it.                                                                                                                                                                     |
@@ -98,6 +112,7 @@ Given validated SLA `S` and evidence `E`, the oracle computes a finite conjuncti
 
 | Order | Check           | Predicate                                                                          | Typical `ResolutionReason` (on failure) |
 | ----- | --------------- | ---------------------------------------------------------------------------------- | --------------------------------------- |
+| 0     | Profile id      | If `S.profile_id` is set, value MUST equal `x402/oracle-qa/api-quality/v1`         | General rejection                       |
 | 1     | Status          | `E.status_code ∈ [S.min_status_code, S.max_status_code]`                           | Status code out of range                |
 | 2     | Latency         | `E.latency_ms ≤ S.max_latency_ms`                                                  | Latency exceeded                        |
 | 3     | Required fields | For each `f` in `S.required_fields`, `E.response_body` is an object containing `f` | Required fields missing                 |
@@ -128,3 +143,12 @@ Sellers SHOULD declare `x402/oracle-qa/api-quality/v1` in marketplace or discove
 ## Appendix A. Informative: alignment with ecosystem guidance
 
 The architecture overview suggests canonical JSON for hashing; **this profile** follows **raw UTF-8 octets** of the stored JSON text as the commitment input, which avoids serializer-dependent drift and matches the reference oracle’s integrity layer. Conceptually both approaches serve the same goal: **the hash is the fingerprint of the agreement and of the proof.**
+
+---
+
+## Appendix B. Informative: `min_body_length` and hash commitment
+
+- **On-chain binding:** `delivery_hash` commits to the **registry file bytes** (e.g. pretty-printed JSON with spaces). Parties MUST hash the **same** octets the oracle will download.
+- **Evaluator `min_body_length`:** The reference implementation measures `min_body_length` against `serde_json::to_string(&response_body)` after parsing. That length can differ from the byte length of a seller’s original wire body (whitespace, key order), so parties SHOULD treat `min_body_length` as a coarse guardrail unless they control normalization end-to-end.
+
+**Worked example:** SLA requires `min_body_length: 10`. Evidence `response_body` is `{"a":1}`. After parse + `serde_json::to_string`, the string might be `{"a":1}` (9 UTF-8 bytes) → **fail** the body-length check even though semantically valid. A document with a longer canonical serialization can pass.

@@ -14,7 +14,12 @@ pub struct OracleConfig {
     pub escrow_program_id: Pubkey,
     pub bind_addr: String,
     pub evaluation_timeout_ms: u64,
-    pub evidence_registry_url: String,
+    /// Ordered list of registry base URLs (mirrors). Tried in order per fetch; first success wins.
+    pub evidence_registry_urls: Vec<String>,
+    /// If set, sent as `Authorization: <value>` on registry GET requests (e.g. `Bearer <token>`).
+    pub evidence_registry_auth_header: Option<String>,
+    pub evidence_fetch_max_retries: u32,
+    pub evidence_fetch_retry_base_ms: u64,
 }
 
 impl OracleConfig {
@@ -41,8 +46,37 @@ impl OracleConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(30_000);
 
-        let evidence_registry_url =
-            env::var("EVIDENCE_REGISTRY_URL").unwrap_or_else(|_| "http://localhost:4021".into());
+        let evidence_registry_urls: Vec<String> = match env::var("EVIDENCE_REGISTRY_URLS") {
+            Ok(s) => {
+                let parts: Vec<String> = s
+                    .split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect();
+                if parts.is_empty() {
+                    vec![env::var("EVIDENCE_REGISTRY_URL")
+                        .unwrap_or_else(|_| "http://localhost:4021".into())]
+                } else {
+                    parts
+                }
+            }
+            Err(_) => vec![env::var("EVIDENCE_REGISTRY_URL")
+                .unwrap_or_else(|_| "http://localhost:4021".into())],
+        };
+
+        let evidence_registry_auth_header = env::var("EVIDENCE_REGISTRY_AUTH_HEADER")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let evidence_fetch_max_retries = env::var("EVIDENCE_FETCH_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let evidence_fetch_retry_base_ms = env::var("EVIDENCE_FETCH_RETRY_BASE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
 
         Ok(Self {
             solana_rpc_url,
@@ -51,7 +85,10 @@ impl OracleConfig {
             escrow_program_id,
             bind_addr,
             evaluation_timeout_ms,
-            evidence_registry_url,
+            evidence_registry_urls,
+            evidence_registry_auth_header,
+            evidence_fetch_max_retries,
+            evidence_fetch_retry_base_ms,
         })
     }
 

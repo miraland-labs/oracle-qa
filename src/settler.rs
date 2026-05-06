@@ -25,6 +25,7 @@ pub async fn settle(
         job.mint,
         &payment_uid_hex,
         job.delivery_hash,
+        [0u8; 32],
         resolution_state,
         resolution_reason,
     );

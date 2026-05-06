@@ -149,8 +149,9 @@ async fn manual_evaluate(
         }
     };
 
-    match crate::pipeline::run_pipeline(&state.config, &job).await {
-        Ok((result, sig)) => {
+    let timeout = tokio::time::Duration::from_millis(state.config.evaluation_timeout_ms);
+    match tokio::time::timeout(timeout, crate::pipeline::run_pipeline(&state.config, &job)).await {
+        Ok(Ok((result, sig))) => {
             let mut stats = state.stats.write().await;
             stats.total_evaluated += 1;
             if result.approved {
@@ -170,7 +171,7 @@ async fn manual_evaluate(
                 }),
             )
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let mut stats = state.stats.write().await;
             stats.total_errors += 1;
 
@@ -181,6 +182,23 @@ async fn manual_evaluate(
                     signature: None,
                     checks: vec![],
                     error: Some(e.to_string()),
+                }),
+            )
+        }
+        Err(_) => {
+            let mut stats = state.stats.write().await;
+            stats.total_errors += 1;
+
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ManualEvaluateResponse {
+                    approved: false,
+                    signature: None,
+                    checks: vec![],
+                    error: Some(format!(
+                        "Pipeline timed out after {}ms",
+                        state.config.evaluation_timeout_ms
+                    )),
                 }),
             )
         }

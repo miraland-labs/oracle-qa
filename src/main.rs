@@ -9,9 +9,10 @@ mod types;
 
 use config::OracleConfig;
 use server::{AppState, OracleStats};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -36,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     info!("RPC:            {}", config.solana_rpc_url);
     info!("WebSocket:      {}", config.solana_ws_url);
     info!("Bind address:   {}", config.bind_addr);
-    info!("Evidence URL:   {}", config.evidence_registry_url);
+    info!("Evidence URLs:  {:?}", config.evidence_registry_urls);
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -53,12 +54,24 @@ async fn main() -> anyhow::Result<()> {
         chain::monitor_deliveries(monitor_config, job_tx).await;
     });
 
+    let processed: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
+
     // Spawn the evaluation worker
     let worker_state = state.clone();
+    let processed_worker = processed.clone();
     tokio::spawn(async move {
         info!("Evaluation worker started");
         while let Some(job) = job_rx.recv().await {
             let uid_hex = hex::encode(job.payment_uid);
+            let uid = job.payment_uid;
+            {
+                let mut seen = processed_worker.lock().await;
+                if !seen.insert(uid) {
+                    warn!("Skipping duplicate job payment_uid={}", uid_hex);
+                    continue;
+                }
+            }
+
             info!("Processing job: payment={}", uid_hex);
 
             let timeout =
@@ -67,7 +80,10 @@ async fn main() -> anyhow::Result<()> {
             match tokio::time::timeout(timeout, pipeline::run_pipeline(&worker_state.config, &job))
                 .await
             {
-                Ok(Ok((result, _sig))) => {
+                Ok(Ok((result, sig))) => {
+                    if let Some(ref s) = sig {
+                        info!("Settlement signature for {}: {}", uid_hex, s);
+                    }
                     let mut stats = worker_state.stats.write().await;
                     stats.total_evaluated += 1;
                     if result.approved {
@@ -79,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(Err(e)) => {
                     error!("Pipeline error for {}: {}", uid_hex, e);
+                    processed_worker.lock().await.remove(&uid);
                     let mut stats = worker_state.stats.write().await;
                     stats.total_errors += 1;
                 }
@@ -87,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
                         "Pipeline timeout for {} ({}ms)",
                         uid_hex, worker_state.config.evaluation_timeout_ms
                     );
+                    processed_worker.lock().await.remove(&uid);
                     let mut stats = worker_state.stats.write().await;
                     stats.total_errors += 1;
                 }
