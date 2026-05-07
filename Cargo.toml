@@ -30,7 +30,8 @@ spl-token = { version = "4", features = ["no-entrypoint"] }
 spl-associated-token-account = { version = "7", features = ["no-entrypoint"] }
 
 # SLA-Escrow API (for instruction builders, event types, account structs)
-sla-escrow-api = { path = "../sla-escrow/api" }
+# sla-escrow-api = { path = "../sla-escrow/api" }
+sla-escrow-api = "0.3.0"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -42,7 +43,10 @@ base64 = "0.22"
 hex = "0.4"
 
 # HTTP client (for fetching SLA docs and delivery evidence)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 
 # Async utilities
 futures-util = "0.3"
@@ -63,7 +67,10 @@ thiserror = "2.0"
 
 # Optional PostgreSQL ledger for production deployments
 deadpool-postgres = { version = "0.14", features = ["serde"] }
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"] }
+tokio-postgres = { version = "0.7", features = [
+    "with-serde_json-1",
+    "with-chrono-0_4",
+] }
 postgres-openssl = "0.5"
 openssl = "0.10"
 
