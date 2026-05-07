@@ -120,6 +120,19 @@ cp .env.example .env
 cargo run --release
 ```
 
+## Production readiness defaults
+
+For a public default oracle, run with:
+
+- `DATABASE_URL` enabled and initialized with [`migrations/init.sql`](migrations/init.sql) so job state, verdicts, and lifecycle events survive restarts.
+- `ORACLE_OPERATOR_TOKEN_SHA256` configured so `POST /evaluate` is operator-only. Leave `ORACLE_ALLOW_UNAUTHENTICATED_MANUAL_EVALUATE=false` outside local demos.
+- `ORACLE_STRICT_PROFILE=true` so SLA documents must declare `version: 1` and `profile_id: "x402/oracle-qa/api-quality/v1"`.
+- `ORACLE_CORS_ALLOWED_ORIGINS` restricted to trusted operator consoles, or unset when the HTTP API is only accessed server-to-server.
+
+`ConfirmOracle` uses a non-zero `resolution_hash`: a deterministic SHA-256 fingerprint over the payment UID, SLA hash, delivery hash, SLA profile/version, approval result, resolution reason, and check results. The full evidence remains off-chain, while the chain stores an audit handle that operators and counterparties can recompute.
+
+Before advertising an oracle authority through `pr402` capabilities, complete the Devnet validation in [`docs/DEVNET_E2E_RUNBOOK.md`](docs/DEVNET_E2E_RUNBOOK.md).
+
 ## Configuration
 
 
@@ -136,6 +149,14 @@ cargo run --release
 | `EVIDENCE_REGISTRY_AUTH_HEADER` | *(unset)*             | Optional `Authorization` header value on registry GET (e.g. `Bearer …`) |
 | `EVIDENCE_FETCH_MAX_RETRIES` | `3`                      | Per-URL retries for transient HTTP failures (still fail closed on hash mismatch) |
 | `EVIDENCE_FETCH_RETRY_BASE_MS` | `200`                  | Exponential backoff base delay            |
+| `DATABASE_URL`           | *(unset)*                       | Optional PostgreSQL ledger; run `migrations/init.sql` first |
+| `ORACLE_OPERATOR_TOKEN_SHA256` | *(unset)*               | SHA-256 hex digest for operator-only `POST /evaluate` |
+| `ORACLE_OPERATOR_TOKEN`  | *(unset)*                       | Plain token convenience; prefer the digest form in production |
+| `ORACLE_ALLOW_UNAUTHENTICATED_MANUAL_EVALUATE` | `false` | Local-only escape hatch for manual evaluation without auth |
+| `ORACLE_CORS_ALLOWED_ORIGINS` | *(unset)*                | Comma-separated browser origins allowed to call the HTTP API |
+| `ORACLE_STRICT_PROFILE`  | `true`                          | Require API quality profile id and version `1` |
+| `ORACLE_DEAD_LETTER_MAX_ATTEMPTS` | `5`                 | Stop automatic retries after this many worker attempts |
+| `ORACLE_JOB_CHANNEL_CAPACITY` | `256`                   | Bounded chain-monitor-to-worker queue size |
 | `RUST_LOG`              | `oracle_qa=info`                | Log level filter                       |
 
 
@@ -189,9 +210,12 @@ Suitable backends: nginx `alias` of static files named by hash, S3 object keyed 
 
 Manual evaluation trigger for a specific payment PDA.
 
+Production deployments require `Authorization: Bearer <operator-token>` or `X-Oracle-Token: <operator-token>` unless explicitly configured otherwise.
+
 ```bash
 curl -X POST http://localhost:4020/evaluate \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ORACLE_OPERATOR_TOKEN" \
   -d '{"payment_pubkey": "PayMeNt..."}'
 ```
 

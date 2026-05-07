@@ -19,6 +19,9 @@ pub enum OracleError {
 
     #[error("Settlement failed: {0}")]
     Settlement(String),
+
+    #[error("Database failed: {0}")]
+    Database(String),
 }
 
 impl From<solana_client::client_error::ClientError> for OracleError {

@@ -78,3 +78,12 @@ pub struct EvaluationJob {
     pub oracle_authority: solana_sdk::pubkey::Pubkey,
     pub expires_at: i64,
 }
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeHealth {
+    pub websocket_connected: bool,
+    pub last_websocket_connected_at: Option<String>,
+    pub last_websocket_message_at: Option<String>,
+    pub last_monitor_error: Option<String>,
+    pub queue_depth: usize,
+}

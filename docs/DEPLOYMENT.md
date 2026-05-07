@@ -2,6 +2,8 @@
 
 `oracle-qa` is a **long-running** Tokio process (WebSocket log subscriber + HTTP API). It is **not** suited to Vercel-style serverless.
 
+For a full Devnet validation before Mainnet/default-oracle advertising, follow [`DEVNET_E2E_RUNBOOK.md`](DEVNET_E2E_RUNBOOK.md).
+
 ## 1. Build on the server (or CI)
 
 ```bash
@@ -53,15 +55,35 @@ Bind `BIND_ADDR=127.0.0.1:4020` and expose **HTTPS** with nginx or Caddy in fron
 ## 4. Operational checklist
 
 - Oracle keypair funded with SOL on the target cluster for `ConfirmOracle` fees.
+- **PostgreSQL ledger:** run `psql "$DATABASE_URL" -f migrations/init.sql`, then set `DATABASE_URL` in `/etc/oracle-qa.env`. The ledger records `oracle_jobs`, `oracle_verdicts`, and append-only `oracle_lifecycle_events` for restart-safe dedupe and audits.
+- **Manual evaluation auth:** set `ORACLE_OPERATOR_TOKEN_SHA256` (preferred) or `ORACLE_OPERATOR_TOKEN`; keep `ORACLE_ALLOW_UNAUTHENTICATED_MANUAL_EVALUATE=false` in production. Expose `POST /evaluate` only through mTLS, VPN, or an authenticated operator proxy.
+- **CORS:** leave `ORACLE_CORS_ALLOWED_ORIGINS` unset for server-to-server operation, or set explicit operator console origins. Do not use permissive browser CORS for a production oracle key.
 - **Evidence registry:** `EVIDENCE_REGISTRY_URL` or **`EVIDENCE_REGISTRY_URLS`** reachable from the VPS (same region reduces latency). Mirrors let you survive a single host outage; the oracle verifies **SHA-256(raw body)** before parsing JSON. Optional **`EVIDENCE_REGISTRY_AUTH_HEADER`** if the registry is not public read.
 - **`EVIDENCE_FETCH_MAX_RETRIES`** / **`EVIDENCE_FETCH_RETRY_BASE_MS`** for transient 5xx or timeouts (still **fail closed** on hash mismatch).
 - `ESCROW_PROGRAM_ID` matches the deployment buyers/sellers use with pr402.
+- **Strict profile:** keep `ORACLE_STRICT_PROFILE=true` for the default API-quality oracle; only disable for legacy devnet artifacts.
 
 ### Chain worker behavior
 
 - **Event-driven jobs:** The worker subscribes to program logs and decodes **`DeliverySubmittedEvent`** (program data / parsed instructions) to find the **payment PDA** where possible, with a fallback scan of transaction account keys if parsing is incomplete.
 - **Dedupe:** While an evaluation is running for a given on-chain **`payment_uid`**, duplicate log lines for the same UID are skipped (the UID is released if the pipeline errors or times out so a later retry can run).
 - **Single-writer expectation:** Running **two** oracle operator instances with the **same** keypair against the same payments can race `ConfirmOracle` and waste fees; use one primary worker or shard by program/deploy.
+- **Dead letters:** failed jobs are retried while their payment UID is released for later events; after `ORACLE_DEAD_LETTER_MAX_ATTEMPTS`, the ledger marks them `dead_letter` for manual review.
+
+### Health and observability
+
+`GET /health` now reports RPC connectivity, WebSocket subscription state, last WebSocket message time, queue depth, registry reachability, oracle SOL balance, database enablement, and strict-profile mode. Alert on:
+
+- `chain_connected=false`
+- `websocket_connected=false`
+- stale `last_websocket_message_at`
+- low `oracle_balance_lamports`
+- rising `total_errors` in `/stats`
+- repeated `dead_letter` lifecycle events in Postgres
+
+### Failover
+
+Use one primary oracle worker per authority. A standby may run with the service stopped or with the oracle key unavailable. During failover, stop the primary, move or unlock the key on the standby, confirm the same `DATABASE_URL`, and start the standby. The on-chain `resolution_state` and the Postgres ledger together prevent ambiguous duplicate settlement state.
 
 ## 5. pr402 buyer/facilitator alignment (SLA-Escrow)
 

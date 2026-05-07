@@ -12,8 +12,22 @@ impl Evaluator {
     pub fn evaluate(
         sla: &SlaDocument,
         evidence: &DeliveryEvidence,
+        strict_profile: bool,
     ) -> Result<EvaluationResult, OracleError> {
         let mut checks = Vec::new();
+
+        let version_ok = sla.version == 1;
+        if strict_profile || !version_ok {
+            checks.push(CheckResult {
+                name: "version".into(),
+                passed: version_ok,
+                detail: if version_ok {
+                    "1".into()
+                } else {
+                    format!("expected 1, got {}", sla.version)
+                },
+            });
+        }
 
         if let Some(pid) = &sla.profile_id {
             let ok = pid == API_QUALITY_V1_PROFILE_ID;
@@ -25,6 +39,12 @@ impl Evaluator {
                 } else {
                     format!("expected '{}', got '{}'", API_QUALITY_V1_PROFILE_ID, pid)
                 },
+            });
+        } else if strict_profile {
+            checks.push(CheckResult {
+                name: "profile_id".into(),
+                passed: false,
+                detail: format!("missing; expected '{}'", API_QUALITY_V1_PROFILE_ID),
             });
         }
 
@@ -118,6 +138,7 @@ impl Evaluator {
                 .find(|c| !c.passed)
                 .map(|c| match c.name.as_str() {
                     "profile_id" => ResolutionReason::GeneralRejection,
+                    "version" => ResolutionReason::GeneralRejection,
                     "status_code" => ResolutionReason::StatusCodeOutOfRange,
                     "latency" => ResolutionReason::LatencyExceeded,
                     "json_schema" => ResolutionReason::SchemaValidationFailed,
@@ -136,5 +157,71 @@ impl Evaluator {
             resolution_reason,
             checks,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{DeliveryEvidence, SlaDocument, API_QUALITY_V1_PROFILE_ID};
+
+    fn valid_sla() -> SlaDocument {
+        SlaDocument {
+            version: 1,
+            profile_id: Some(API_QUALITY_V1_PROFILE_ID.into()),
+            endpoint: "https://api.example.test/data".into(),
+            method: "GET".into(),
+            response_schema: None,
+            required_fields: vec!["result".into()],
+            max_latency_ms: 500,
+            min_status_code: 200,
+            max_status_code: 299,
+            min_body_length: None,
+        }
+    }
+
+    fn valid_evidence() -> DeliveryEvidence {
+        DeliveryEvidence {
+            status_code: 200,
+            latency_ms: 42,
+            response_body: serde_json::json!({ "result": "ok" }),
+            response_headers: None,
+            timestamp: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn strict_profile_requires_profile_id() {
+        let mut sla = valid_sla();
+        sla.profile_id = None;
+
+        let result = Evaluator::evaluate(&sla, &valid_evidence(), true).unwrap();
+
+        assert!(!result.approved);
+        assert!(result
+            .checks
+            .iter()
+            .any(|check| check.name == "profile_id" && !check.passed));
+    }
+
+    #[test]
+    fn strict_profile_requires_version_one() {
+        let mut sla = valid_sla();
+        sla.version = 2;
+
+        let result = Evaluator::evaluate(&sla, &valid_evidence(), true).unwrap();
+
+        assert!(!result.approved);
+        assert!(result
+            .checks
+            .iter()
+            .any(|check| check.name == "version" && !check.passed));
+    }
+
+    #[test]
+    fn valid_evidence_approves() {
+        let result = Evaluator::evaluate(&valid_sla(), &valid_evidence(), true).unwrap();
+
+        assert!(result.approved);
     }
 }

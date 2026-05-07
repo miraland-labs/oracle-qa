@@ -1,4 +1,8 @@
-use crate::{config::OracleConfig, error::OracleError, types::EvaluationJob};
+use crate::{
+    config::OracleConfig,
+    error::OracleError,
+    types::{EvaluationJob, RuntimeHealth},
+};
 use base64::{engine::general_purpose::STANDARD as B64_ENGINE, Engine};
 use futures_util::StreamExt;
 use sla_escrow_api::{event::DeliverySubmittedEvent, instruction::EscrowInstruction};
@@ -12,7 +16,7 @@ use solana_transaction_status::{
 };
 use solana_transaction_status_client_types::ParsedAccount;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
 /// Parse `DeliverySubmittedEvent` from RPC log lines (`sol_log_data` → `Program data: <base64>`).
@@ -155,7 +159,11 @@ pub async fn read_payment(
 
 /// Subscribe to on-chain logs for the escrow program and emit EvaluationJobs
 /// when a `SubmitDelivery` / delivery event is detected.
-pub async fn monitor_deliveries(config: Arc<OracleConfig>, tx: mpsc::Sender<EvaluationJob>) {
+pub async fn monitor_deliveries(
+    config: Arc<OracleConfig>,
+    tx: mpsc::Sender<EvaluationJob>,
+    health: Arc<RwLock<RuntimeHealth>>,
+) {
     loop {
         info!("Connecting to Solana WebSocket at {}", config.solana_ws_url);
 
@@ -172,8 +180,18 @@ pub async fn monitor_deliveries(config: Arc<OracleConfig>, tx: mpsc::Sender<Eval
                 match pubsub.logs_subscribe(filter, log_config).await {
                     Ok((mut stream, _unsub)) => {
                         info!("Subscribed to escrow program logs");
+                        {
+                            let mut h = health.write().await;
+                            h.websocket_connected = true;
+                            h.last_websocket_connected_at = Some(chrono::Utc::now().to_rfc3339());
+                            h.last_monitor_error = None;
+                        }
 
                         while let Some(log_response) = stream.next().await {
+                            {
+                                let mut h = health.write().await;
+                                h.last_websocket_message_at = Some(chrono::Utc::now().to_rfc3339());
+                            }
                             let logs = &log_response.value.logs;
                             let has_delivery = logs.iter().any(|l| {
                                 l.contains("DeliverySubmittedEvent") || l.contains("Program data:")
@@ -201,14 +219,23 @@ pub async fn monitor_deliveries(config: Arc<OracleConfig>, tx: mpsc::Sender<Eval
                             }
                         }
                         warn!("Log subscription stream ended, reconnecting...");
+                        let mut h = health.write().await;
+                        h.websocket_connected = false;
+                        h.last_monitor_error = Some("log subscription stream ended".into());
                     }
                     Err(e) => {
                         error!("Failed to subscribe to logs: {}", e);
+                        let mut h = health.write().await;
+                        h.websocket_connected = false;
+                        h.last_monitor_error = Some(e.to_string());
                     }
                 }
             }
             Err(e) => {
                 error!("WebSocket connection failed: {}", e);
+                let mut h = health.write().await;
+                h.websocket_connected = false;
+                h.last_monitor_error = Some(e.to_string());
             }
         }
 

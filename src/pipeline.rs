@@ -10,6 +10,12 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+pub struct PipelineOutcome {
+    pub result: EvaluationResult,
+    pub signature: Option<String>,
+    pub resolution_hash: [u8; 32],
+}
+
 /// Fetch raw bytes from registry mirrors with retry/backoff; verify SHA256 before parsing JSON.
 async fn fetch_evidence<T: serde::de::DeserializeOwned>(
     config: &OracleConfig,
@@ -102,7 +108,7 @@ async fn fetch_evidence<T: serde::de::DeserializeOwned>(
 pub async fn run_pipeline(
     config: &OracleConfig,
     job: &EvaluationJob,
-) -> Result<(EvaluationResult, Option<String>), OracleError> {
+) -> Result<PipelineOutcome, OracleError> {
     let uid_hex = hex::encode(job.payment_uid);
     info!("Pipeline started for payment {}", uid_hex);
 
@@ -136,7 +142,8 @@ pub async fn run_pipeline(
     );
 
     // Step 3: Evaluate
-    let result = Evaluator::evaluate(&sla, &evidence)?;
+    let result = Evaluator::evaluate(&sla, &evidence, config.strict_profile)?;
+    let resolution_hash = settler::compute_resolution_hash(job, &sla, &result)?;
 
     let verdict = if result.approved {
         "APPROVED"
@@ -156,7 +163,15 @@ pub async fn run_pipeline(
     }
 
     // Step 4: Settle on-chain
-    let sig = match settler::settle(config, job, result.approved, result.resolution_reason).await {
+    let sig = match settler::settle(
+        config,
+        job,
+        result.approved,
+        result.resolution_reason,
+        resolution_hash,
+    )
+    .await
+    {
         Ok(sig) => {
             info!("Settlement confirmed: sig={}", sig);
             Some(sig)
@@ -167,5 +182,91 @@ pub async fn run_pipeline(
         }
     };
 
-    Ok((result, sig))
+    Ok(PipelineOutcome {
+        result,
+        signature: sig,
+        resolution_hash,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::API_QUALITY_V1_PROFILE_ID;
+    use axum::{routing::get, Router};
+    use solana_sdk::{pubkey::Pubkey, signature::Keypair};
+    use std::sync::Arc;
+
+    fn test_config(base_url: String) -> OracleConfig {
+        OracleConfig {
+            solana_rpc_url: "http://127.0.0.1:8899".into(),
+            solana_ws_url: "ws://127.0.0.1:8900".into(),
+            oracle_keypair: Arc::new(Keypair::new()),
+            escrow_program_id: Pubkey::new_unique(),
+            bind_addr: "127.0.0.1:0".into(),
+            evaluation_timeout_ms: 30_000,
+            evidence_registry_urls: vec![base_url],
+            evidence_registry_auth_header: None,
+            evidence_fetch_max_retries: 1,
+            evidence_fetch_retry_base_ms: 1,
+            database_url: None,
+            operator_token_sha256: None,
+            allow_unauthenticated_manual_evaluate: false,
+            cors_allowed_origins: vec![],
+            manual_evaluate_rate_limit: 30,
+            manual_evaluate_rate_window_ms: 60_000,
+            strict_profile: true,
+            dead_letter_max_attempts: 5,
+            job_channel_capacity: 16,
+        }
+    }
+
+    async fn spawn_registry(body: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = Arc::new(body);
+        let app = Router::new().route(
+            "/{hash}",
+            get(move || {
+                let body = body.clone();
+                async move { body.as_str().to_owned() }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn fetch_evidence_accepts_hash_bound_document() {
+        let body = serde_json::json!({
+            "version": 1,
+            "profile_id": API_QUALITY_V1_PROFILE_ID,
+            "endpoint": "https://api.example.test",
+            "method": "GET"
+        })
+        .to_string();
+        let digest = Sha256::digest(body.as_bytes());
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&digest);
+        let config = test_config(spawn_registry(body).await);
+
+        let sla: SlaDocument = fetch_evidence(&config, &hash, OracleError::SlaParse)
+            .await
+            .unwrap();
+
+        assert_eq!(sla.version, 1);
+        assert_eq!(sla.profile_id.as_deref(), Some(API_QUALITY_V1_PROFILE_ID));
+    }
+
+    #[tokio::test]
+    async fn fetch_evidence_rejects_hash_mismatch() {
+        let config = test_config(spawn_registry("{\"version\":1}".into()).await);
+        let err = fetch_evidence::<SlaDocument>(&config, &[9u8; 32], OracleError::SlaParse)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Hash mismatch"));
+    }
 }
