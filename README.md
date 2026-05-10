@@ -157,6 +157,8 @@ Before advertising an oracle authority through `pr402` capabilities, complete th
 | `ORACLE_STRICT_PROFILE`  | `true`                          | Require API quality profile id and version `1` |
 | `ORACLE_DEAD_LETTER_MAX_ATTEMPTS` | `5`                 | Stop automatic retries after this many worker attempts |
 | `ORACLE_JOB_CHANNEL_CAPACITY` | `256`                   | Bounded chain-monitor-to-worker queue size |
+| `ORACLE_REQUIRE_EVENT_MATCH` | `false`                    | Refuse to emit jobs unless the tx carries a matching `DeliverySubmittedEvent` (recommended on Mainnet) |
+| `ORACLE_BACKFILL_LOOKBACK_SIGNATURES` | `2000`            | Max signatures scanned on startup to recover deliveries missed while offline (`0` disables) |
 | `RUST_LOG`              | `oracle_qa=info`                | Log level filter                       |
 
 
@@ -184,12 +186,18 @@ Suitable backends: nginx `alias` of static files named by hash, S3 object keyed 
 
 ### `GET /health`
 
+Reports live chain/WebSocket/DB/registry status plus the monitor's last observed slot.
+
 ```json
 {
   "status": "healthy",
   "oracle_pubkey": "OracLe...",
   "program_id": "Escr4...",
-  "chain_connected": true
+  "chain_connected": true,
+  "websocket_connected": true,
+  "last_seen_slot": 287654321,
+  "deliveries_observed": 42,
+  "registry_reachable": true
 }
 ```
 
@@ -201,9 +209,22 @@ Suitable backends: nginx `alias` of static files named by hash, S3 object keyed 
   "total_approved": 38,
   "total_rejected": 3,
   "total_errors": 1,
+  "total_dead_letter": 0,
+  "total_evidence_fetch_failures": 0,
   "uptime_seconds": 86400,
   "last_evaluation_at": "2026-04-06T12:00:00Z"
 }
+```
+
+### `GET /metrics`
+
+Prometheus text exposition (`text/plain; version=0.0.4`). Emits counters and gauges for
+`total_evaluated`, `total_approved`, `total_rejected`, `total_errors`, `total_dead_letter`,
+`total_evidence_fetch_failures`, `queue_depth`, `websocket_connected`,
+`deliveries_observed`, `last_seen_slot`, and process `uptime_seconds`.
+
+```bash
+curl -sS http://127.0.0.1:4020/metrics
 ```
 
 ### `POST /evaluate`
@@ -224,11 +245,19 @@ curl -X POST http://localhost:4020/evaluate \
 This project serves as the **reference implementation** for building x402 SLA-Escrow oracles. To create your own domain-specific oracle:
 
 1. Fork this project
-2. Replace the `Evaluator` with your domain logic
-3. Keep the chain monitor, pipeline, and settler modules
-4. Define your own SLA document schema for your domain
+2. Implement the [`QualityOracle`](src/evaluator.rs) trait on your own type (`profile_id` + `evaluate`) — the chain monitor, evidence fetcher, settler, ledger, and HTTP surface remain the same
+3. Wire your implementation into [`pipeline.rs`](src/pipeline.rs) in place of the default `Evaluator`
+4. Define your own SLA document schema (and, optionally, a new `profile_id` + JSON Schema under `spec/`)
 
-The evaluation interface is intentionally simple: given an SLA document and delivery evidence, return approved/rejected with check details.
+The evaluation interface is intentionally simple: given an SLA document and delivery evidence, return an `EvaluationResult` with `approved` + `resolution_reason` + itemized `checks`.
+
+## Operational characteristics
+
+- **Restart-safe dedupe** — with `DATABASE_URL` set, the worker checks the ledger for a terminal state (`settled` / `dead_letter`) before re-running. No in-memory `HashSet` resets on restart; duplicate log events are absorbed cheaply.
+- **Startup backfill** — on launch, `oracle-qa` scans the last `ORACLE_BACKFILL_LOOKBACK_SIGNATURES` program signatures via `getSignaturesForAddress`, decodes any matching `SubmitDelivery` instructions, and emits evaluation jobs for deliveries that landed while this oracle was offline. The ledger's `oracle_parameters.chain.last_seen_slot` watermark bounds the scan on subsequent restarts.
+- **Strict event matching** — set `ORACLE_REQUIRE_EVENT_MATCH=true` to refuse emitting a job from a log notification unless the transaction carries a matching `DeliverySubmittedEvent` for the same `payment_uid` + `delivery_hash`. Recommended on Mainnet; disable only for RPC providers that truncate program-data.
+- **Shared clients** — a single `reqwest::Client` and `Arc<RpcClient>` are held in `AppState` and used across the chain monitor, pipeline, evaluator, settler, and HTTP handlers. No per-request connection pool churn.
+- **On-chain clock** — `is_eligible` reads the Solana `Clock` sysvar rather than the wall clock before submitting `ConfirmOracle`; this keeps eligibility consistent with what the program observes when the tx lands.
 
 ## License
 

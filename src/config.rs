@@ -29,6 +29,16 @@ pub struct OracleConfig {
     pub strict_profile: bool,
     pub dead_letter_max_attempts: u32,
     pub job_channel_capacity: usize,
+    /// When `true`, refuse to emit a job from a log notification unless the transaction
+    /// includes a matching `DeliverySubmittedEvent` program-data line for the same
+    /// `payment_uid` and `delivery_hash`. Strict mode is recommended on mainnet; the
+    /// non-strict fallback exists for RPC providers that occasionally truncate program
+    /// data in the JSON-parsed response.
+    pub require_event_match: bool,
+    /// Maximum number of past program signatures to scan during startup catch-up.
+    /// Set to `0` to disable the startup backfill entirely (useful for brand-new
+    /// deployments or when replaying from an empty ledger is undesirable).
+    pub backfill_lookback_signatures: usize,
 }
 
 impl OracleConfig {
@@ -133,6 +143,11 @@ impl OracleConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(256);
+        let require_event_match = env_bool("ORACLE_REQUIRE_EVENT_MATCH", false);
+        let backfill_lookback_signatures = env::var("ORACLE_BACKFILL_LOOKBACK_SIGNATURES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2000);
 
         Ok(Self {
             solana_rpc_url,
@@ -154,6 +169,8 @@ impl OracleConfig {
             strict_profile,
             dead_letter_max_attempts,
             job_channel_capacity,
+            require_event_match,
+            backfill_lookback_signatures,
         })
     }
 

@@ -1,33 +1,30 @@
 use crate::{
-    config::OracleConfig,
     error::OracleError,
+    server::AppState,
     types::{EvaluationJob, EvaluationResult, SlaDocument},
 };
 use sha2::{Digest, Sha256};
 use sla_escrow_api::sdk::EscrowSdk;
-use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{commitment_config::CommitmentConfig, transaction::Transaction};
+use solana_sdk::{
+    commitment_config::CommitmentConfig, sysvar::clock::Clock, transaction::Transaction,
+};
+use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Build, sign, and send a ConfirmOracle transaction.
+/// Build, sign, and send a `ConfirmOracle` transaction using the shared RPC client.
 pub async fn settle(
-    config: &OracleConfig,
+    state: &Arc<AppState>,
     job: &EvaluationJob,
     approved: bool,
     resolution_reason: u16,
     resolution_hash: [u8; 32],
 ) -> Result<String, OracleError> {
-    let rpc = RpcClient::new_with_commitment(
-        config.solana_rpc_url.clone(),
-        CommitmentConfig::confirmed(),
-    );
-
     let resolution_state: u8 = if approved { 1 } else { 2 };
 
     let payment_uid_hex = hex::encode(job.payment_uid);
 
     let ix = EscrowSdk::confirm_oracle(
-        config.oracle_pubkey(),
+        state.config.oracle_pubkey(),
         job.mint,
         &payment_uid_hex,
         job.delivery_hash,
@@ -36,19 +33,21 @@ pub async fn settle(
         resolution_reason,
     );
 
-    let recent_blockhash = rpc
+    let recent_blockhash = state
+        .rpc
         .get_latest_blockhash()
         .await
         .map_err(|e| OracleError::Settlement(format!("Failed to get blockhash: {}", e)))?;
 
     let tx = Transaction::new_signed_with_payer(
         &[ix],
-        Some(&config.oracle_pubkey()),
-        &[config.oracle_keypair.as_ref()],
+        Some(&state.config.oracle_pubkey()),
+        &[state.config.oracle_keypair.as_ref()],
         recent_blockhash,
     );
 
-    let sig = rpc
+    let sig = state
+        .rpc
         .send_and_confirm_transaction(&tx)
         .await
         .map_err(|e| OracleError::Settlement(format!("Transaction failed: {}", e)))?;
@@ -88,15 +87,49 @@ pub fn compute_resolution_hash(
     Ok(out)
 }
 
-/// Check if a payment is still eligible for oracle confirmation.
-/// Returns false if already resolved, expired, or not assigned to this oracle.
-pub async fn is_eligible(config: &OracleConfig, job: &EvaluationJob) -> Result<bool, OracleError> {
-    let rpc = RpcClient::new_with_commitment(
-        config.solana_rpc_url.clone(),
-        CommitmentConfig::confirmed(),
-    );
+/// Read the on-chain Clock sysvar; fall back to the wall clock on RPC error so the
+/// oracle still makes progress on transient infra hiccups (operators see the degraded
+/// state via `/health.chain_connected`).
+async fn chain_unix_timestamp(state: &AppState) -> i64 {
+    match state
+        .rpc
+        .get_account_with_commitment(
+            &solana_sdk::sysvar::clock::ID,
+            CommitmentConfig::confirmed(),
+        )
+        .await
+    {
+        Ok(resp) => match resp.value {
+            Some(account) => match bincode::deserialize::<Clock>(&account.data) {
+                Ok(clock) => clock.unix_timestamp,
+                Err(e) => {
+                    warn!(
+                        "Failed to decode on-chain Clock, falling back to wall clock: {}",
+                        e
+                    );
+                    chrono::Utc::now().timestamp()
+                }
+            },
+            None => {
+                warn!("Clock sysvar account missing; falling back to wall clock");
+                chrono::Utc::now().timestamp()
+            }
+        },
+        Err(e) => {
+            warn!(
+                "RPC get_account for Clock sysvar failed, falling back to wall clock: {}",
+                e
+            );
+            chrono::Utc::now().timestamp()
+        }
+    }
+}
 
-    let account = rpc
+/// Check if a payment is still eligible for oracle confirmation.
+/// Returns false if already resolved, expired (by on-chain clock), or not assigned to this oracle.
+pub async fn is_eligible(state: &Arc<AppState>, job: &EvaluationJob) -> Result<bool, OracleError> {
+    let account = state
+        .rpc
         .get_account_with_commitment(&job.payment_pubkey, CommitmentConfig::confirmed())
         .await?
         .value;
@@ -114,7 +147,14 @@ pub async fn is_eligible(config: &OracleConfig, job: &EvaluationJob) -> Result<b
         &account.data[8..8 + std::mem::size_of::<sla_escrow_api::state::Payment>()],
     );
 
-    if payment.oracle_authority != config.oracle_pubkey() {
+    if payment.oracle_authority != state.config.oracle_pubkey() {
+        return Ok(false);
+    }
+
+    // Defense-in-depth against stale chain reads: the on-chain ConfirmOracle handler
+    // itself enforces `delivery_timestamp != 0`, so refuse early rather than sending a
+    // doomed tx that would waste the oracle's SOL on fees.
+    if payment.delivery_timestamp == 0 {
         return Ok(false);
     }
 
@@ -123,8 +163,9 @@ pub async fn is_eligible(config: &OracleConfig, job: &EvaluationJob) -> Result<b
         return Ok(false);
     }
 
-    // Check expiry (use current time as rough estimate; on-chain clock may differ slightly)
-    let now = chrono::Utc::now().timestamp();
+    // Prefer on-chain Clock over the operator's wall clock; keeps eligibility consistent
+    // with what the program will observe when the tx lands.
+    let now = chain_unix_timestamp(state).await;
     if now > payment.expires_at {
         warn!(
             "Payment {} has expired (expires_at={}, now={})",

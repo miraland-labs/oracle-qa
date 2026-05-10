@@ -106,6 +106,96 @@ impl OracleDb {
             .await
     }
 
+    /// Return true when the payment UID has already reached a terminal state in the ledger.
+    ///
+    /// Terminal means "this oracle instance (or a peer sharing the same ledger) has already
+    /// settled or permanently dead-lettered the job" — used for restart-safe dedupe so duplicate
+    /// log events (e.g. on WS reconnect) do not trigger a redundant `ConfirmOracle` settle.
+    pub async fn is_terminal(&self, payment_uid: &[u8; 32]) -> Result<bool, DbError> {
+        const SQL: &str = r#"
+            SELECT 1
+              FROM oracle_jobs
+             WHERE payment_uid = $1
+               AND status IN ('settled', 'dead_letter')
+             LIMIT 1
+        "#;
+
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| DbError::Pool(format_err_chain(&e)))?;
+        let uid = hex::encode(payment_uid);
+        match timeout(Self::QUERY_TIMEOUT, client.query_opt(SQL, &[&uid])).await {
+            Ok(Ok(row)) => Ok(row.is_some()),
+            Ok(Err(e)) => Err(DbError::Query(format_err_chain(&e))),
+            Err(_) => Err(DbError::Timeout),
+        }
+    }
+
+    /// Current attempt count for a payment UID (0 when no row exists).
+    pub async fn attempt_count(&self, payment_uid: &[u8; 32]) -> Result<i32, DbError> {
+        const SQL: &str = r#"
+            SELECT attempts FROM oracle_jobs WHERE payment_uid = $1
+        "#;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| DbError::Pool(format_err_chain(&e)))?;
+        let uid = hex::encode(payment_uid);
+        match timeout(Self::QUERY_TIMEOUT, client.query_opt(SQL, &[&uid])).await {
+            Ok(Ok(Some(row))) => Ok(row.get::<_, i32>(0)),
+            Ok(Ok(None)) => Ok(0),
+            Ok(Err(e)) => Err(DbError::Query(format_err_chain(&e))),
+            Err(_) => Err(DbError::Timeout),
+        }
+    }
+
+    /// Read an `oracle_parameters` row as a string (None when absent or inactive).
+    pub async fn get_parameter(&self, name: &str) -> Result<Option<String>, DbError> {
+        const SQL: &str = r#"
+            SELECT param_value
+              FROM oracle_parameters
+             WHERE param_name = $1
+               AND inactive = FALSE
+             LIMIT 1
+        "#;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| DbError::Pool(format_err_chain(&e)))?;
+        match timeout(Self::QUERY_TIMEOUT, client.query_opt(SQL, &[&name])).await {
+            Ok(Ok(Some(row))) => Ok(Some(row.get::<_, String>(0))),
+            Ok(Ok(None)) => Ok(None),
+            Ok(Err(e)) => Err(DbError::Query(format_err_chain(&e))),
+            Err(_) => Err(DbError::Timeout),
+        }
+    }
+
+    /// Upsert an `oracle_parameters` row (active by default).
+    pub async fn set_parameter(&self, name: &str, value: &str) -> Result<(), DbError> {
+        const SQL: &str = r#"
+            INSERT INTO oracle_parameters (param_name, param_value, inactive, updated_at)
+            VALUES ($1, $2, FALSE, NOW())
+            ON CONFLICT (param_name) DO UPDATE SET
+                param_value = EXCLUDED.param_value,
+                inactive    = FALSE,
+                updated_at  = NOW()
+        "#;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| DbError::Pool(format_err_chain(&e)))?;
+        match timeout(Self::QUERY_TIMEOUT, client.execute(SQL, &[&name, &value])).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(DbError::Query(format_err_chain(&e))),
+            Err(_) => Err(DbError::Timeout),
+        }
+    }
+
     pub async fn record_settled(
         &self,
         job: &EvaluationJob,

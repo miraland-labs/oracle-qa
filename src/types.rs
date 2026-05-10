@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 /// Profile identifier for `x402/oracle-qa/api-quality/v1` (must match SLA when `profile_id` is set).
 pub const API_QUALITY_V1_PROFILE_ID: &str = "x402/oracle-qa/api-quality/v1";
 
+/// Key name in `oracle_parameters` for the most recently processed chain slot.
+/// Used on restart to backfill any deliveries that landed while this oracle was offline.
+pub const PARAM_LAST_SEEN_SLOT: &str = "chain.last_seen_slot";
+
 /// Off-chain SLA document that defines the quality contract.
 /// `payment.sla_hash` MUST equal SHA256(UTF-8 octets of the SLA JSON); see `spec/api-quality-v1/NORMATIVE.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,4 +90,8 @@ pub struct RuntimeHealth {
     pub last_websocket_message_at: Option<String>,
     pub last_monitor_error: Option<String>,
     pub queue_depth: usize,
+    /// Monotonic counter of deliveries emitted by the chain monitor (accepted jobs).
+    pub deliveries_observed: u64,
+    /// Most recently observed chain slot (via log notifications). Informational for backfill diagnostics.
+    pub last_seen_slot: u64,
 }

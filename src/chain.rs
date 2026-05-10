@@ -1,13 +1,14 @@
 use crate::{
     config::OracleConfig,
     error::OracleError,
-    types::{EvaluationJob, RuntimeHealth},
+    types::{EvaluationJob, RuntimeHealth, PARAM_LAST_SEEN_SLOT},
 };
 use base64::{engine::general_purpose::STANDARD as B64_ENGINE, Engine};
 use futures_util::StreamExt;
 use sla_escrow_api::{event::DeliverySubmittedEvent, instruction::EscrowInstruction};
 use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_client::rpc_config::{RpcTransactionConfig, RpcTransactionLogsConfig};
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature};
 use solana_transaction_status::{
@@ -15,7 +16,7 @@ use solana_transaction_status::{
     UiMessage, UiParsedInstruction, UiPartiallyDecodedInstruction, UiTransactionEncoding,
 };
 use solana_transaction_status_client_types::ParsedAccount;
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
@@ -159,8 +160,12 @@ pub async fn read_payment(
 
 /// Subscribe to on-chain logs for the escrow program and emit EvaluationJobs
 /// when a `SubmitDelivery` / delivery event is detected.
+///
+/// `rpc` is the shared non-blocking RPC client from [`AppState`]; reusing it
+/// avoids creating a new client per notification.
 pub async fn monitor_deliveries(
     config: Arc<OracleConfig>,
+    rpc: Arc<RpcClient>,
     tx: mpsc::Sender<EvaluationJob>,
     health: Arc<RwLock<RuntimeHealth>>,
 ) {
@@ -188,9 +193,13 @@ pub async fn monitor_deliveries(
                         }
 
                         while let Some(log_response) = stream.next().await {
+                            let slot = log_response.context.slot;
                             {
                                 let mut h = health.write().await;
                                 h.last_websocket_message_at = Some(chrono::Utc::now().to_rfc3339());
+                                if slot > h.last_seen_slot {
+                                    h.last_seen_slot = slot;
+                                }
                             }
                             let logs = &log_response.value.logs;
                             let has_delivery = logs.iter().any(|l| {
@@ -201,13 +210,17 @@ pub async fn monitor_deliveries(
                             }
 
                             if let Ok(sig) = log_response.value.signature.parse::<Signature>() {
-                                let rpc = RpcClient::new(config.solana_rpc_url.clone());
                                 match fetch_delivery_job(&rpc, &sig, &config).await {
                                     Ok(Some(job)) => {
                                         info!(
                                             "New delivery detected: payment_uid={}",
                                             hex::encode(job.payment_uid)
                                         );
+                                        {
+                                            let mut h = health.write().await;
+                                            h.deliveries_observed =
+                                                h.deliveries_observed.saturating_add(1);
+                                        }
                                         if tx.send(job).await.is_err() {
                                             error!("Job channel closed, stopping monitor");
                                             return;
@@ -281,6 +294,8 @@ async fn fetch_delivery_job(
         })
         .unwrap_or_default();
 
+    let require_match = config.require_event_match;
+
     if let UiMessage::Parsed(pm) = &ui_tx.message {
         let mut candidates = collect_payment_candidates_from_instructions(
             &pm.instructions,
@@ -308,11 +323,17 @@ async fn fetch_delivery_job(
                 if event_matches_job(&log_events, &job) {
                     return Ok(Some(job));
                 }
-                if log_events.is_empty() {
-                    // No parsed program data (some RPC truncations); still try the structured account path.
+                // Strict mode: refuse to accept a job without an explicit matching
+                // DeliverySubmittedEvent. Prevents log-parser races from surfacing
+                // an unrelated Payment PDA that happens to be owned by this oracle.
+                if !require_match && log_events.is_empty() {
                     return Ok(Some(job));
                 }
             }
+        }
+
+        if require_match {
+            return Ok(None);
         }
 
         let account_keys: Vec<Pubkey> = pm
@@ -340,6 +361,163 @@ fn event_matches_job(events: &[DeliverySubmittedEvent], job: &EvaluationJob) -> 
     events
         .iter()
         .any(|e| e.payment_uid == job.payment_uid && e.delivery_hash == job.delivery_hash)
+}
+
+/// Catch up on deliveries submitted while this oracle was offline.
+///
+/// Best-effort backfill: walk `getSignaturesForAddress` for the escrow program
+/// backwards from the most recent signature, fetch transactions, decode matching
+/// `SubmitDelivery` instructions, and emit evaluation jobs for any payment still
+/// owned by this oracle and pending resolution. Stops as soon as either:
+///
+/// * we have scanned more than `config.backfill_lookback_signatures` (caller bound), or
+/// * we reach a signature at or below `last_seen_slot` (persisted in `oracle_parameters`).
+///
+/// Duplicate jobs are harmless — the worker's ledger-backed dedupe skips anything
+/// already settled or in flight; this only pulls in deliveries that a restart would
+/// otherwise miss entirely.
+pub async fn backfill_missed_deliveries(
+    config: Arc<OracleConfig>,
+    rpc: Arc<RpcClient>,
+    tx: mpsc::Sender<EvaluationJob>,
+    db: Option<crate::db::OracleDb>,
+    health: Arc<RwLock<RuntimeHealth>>,
+) {
+    if config.backfill_lookback_signatures == 0 {
+        return;
+    }
+
+    let last_seen_slot: u64 = match &db {
+        Some(ledger) => match ledger.get_parameter(PARAM_LAST_SEEN_SLOT).await {
+            Ok(Some(raw)) => raw.parse().unwrap_or(0),
+            _ => 0,
+        },
+        None => 0,
+    };
+
+    info!(
+        "Backfill: scanning up to {} signatures for {} (last_seen_slot={})",
+        config.backfill_lookback_signatures, config.escrow_program_id, last_seen_slot
+    );
+
+    let limit_per_page: usize = 1000;
+    let max = config.backfill_lookback_signatures;
+    let mut scanned: usize = 0;
+    let mut before: Option<Signature> = None;
+    let mut emitted: usize = 0;
+    let mut highest_slot: u64 = last_seen_slot;
+
+    'outer: loop {
+        let want = (max - scanned).min(limit_per_page);
+        if want == 0 {
+            break;
+        }
+
+        let fetch_config = GetConfirmedSignaturesForAddress2Config {
+            before,
+            until: None,
+            limit: Some(want),
+            commitment: Some(CommitmentConfig::confirmed()),
+        };
+
+        let batch = match rpc
+            .get_signatures_for_address_with_config(&config.escrow_program_id, fetch_config)
+            .await
+        {
+            Ok(batch) => batch,
+            Err(e) => {
+                warn!("Backfill: getSignaturesForAddress failed: {}", e);
+                break;
+            }
+        };
+
+        if batch.is_empty() {
+            break;
+        }
+
+        for entry in &batch {
+            scanned += 1;
+            let slot = entry.slot;
+            if slot > highest_slot {
+                highest_slot = slot;
+            }
+            if last_seen_slot > 0 && slot <= last_seen_slot {
+                // Anything at or below the watermark was processed in a prior run.
+                break 'outer;
+            }
+
+            if entry.err.is_some() {
+                continue;
+            }
+
+            let sig = match Signature::from_str(&entry.signature) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            match fetch_delivery_job(&rpc, &sig, &config).await {
+                Ok(Some(job)) => {
+                    info!(
+                        "Backfill: emitting missed delivery payment_uid={} (sig={}, slot={})",
+                        hex::encode(job.payment_uid),
+                        sig,
+                        slot
+                    );
+                    if tx.send(job).await.is_err() {
+                        warn!("Backfill: job channel closed; aborting backfill");
+                        break 'outer;
+                    }
+                    emitted += 1;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // These are informational — most tx in the program log are not deliveries.
+                    tracing::debug!("Backfill: skip {}: {}", sig, e);
+                }
+            }
+
+            before = Some(sig);
+        }
+
+        if batch.len() < want {
+            break;
+        }
+    }
+
+    if highest_slot > 0 {
+        if let Some(ledger) = &db {
+            if let Err(e) = ledger
+                .set_parameter(PARAM_LAST_SEEN_SLOT, &highest_slot.to_string())
+                .await
+            {
+                warn!(error = %e, "Backfill: failed to persist last_seen_slot");
+            }
+        }
+        let mut h = health.write().await;
+        if highest_slot > h.last_seen_slot {
+            h.last_seen_slot = highest_slot;
+        }
+    }
+
+    info!(
+        "Backfill complete: scanned {} signatures, emitted {} missed job(s); last_seen_slot={}",
+        scanned, emitted, highest_slot
+    );
+}
+
+/// Persist the current `last_seen_slot` watermark. Call from the worker after a job
+/// completes so a restart can resume correctly.
+pub async fn persist_slot_watermark(db: &crate::db::OracleDb, health: &Arc<RwLock<RuntimeHealth>>) {
+    let slot = health.read().await.last_seen_slot;
+    if slot == 0 {
+        return;
+    }
+    if let Err(e) = db
+        .set_parameter(PARAM_LAST_SEEN_SLOT, &slot.to_string())
+        .await
+    {
+        tracing::debug!(error = %e, "ledger: failed to persist last_seen_slot");
+    }
 }
 
 #[cfg(test)]

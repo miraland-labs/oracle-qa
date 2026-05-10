@@ -1,13 +1,13 @@
 use crate::{
-    config::OracleConfig,
     error::OracleError,
-    evaluator::Evaluator,
+    evaluator::{Evaluator, QualityOracle},
+    server::AppState,
     settler,
     types::{DeliveryEvidence, EvaluationJob, EvaluationResult, SlaDocument},
 };
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tracing::{error, info, warn};
 
 pub struct PipelineOutcome {
@@ -18,15 +18,13 @@ pub struct PipelineOutcome {
 
 /// Fetch raw bytes from registry mirrors with retry/backoff; verify SHA256 before parsing JSON.
 async fn fetch_evidence<T: serde::de::DeserializeOwned>(
-    config: &OracleConfig,
+    state: &AppState,
     hash: &[u8; 32],
     parse_error: fn(String) -> OracleError,
 ) -> Result<T, OracleError> {
     let hash_hex = hex::encode(hash);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| OracleError::EvidenceNotFound(e.to_string()))?;
+    let client = &state.http;
+    let config = &state.config;
 
     let mut headers = HeaderMap::new();
     if let Some(auth) = &config.evidence_registry_auth_header {
@@ -91,6 +89,12 @@ async fn fetch_evidence<T: serde::de::DeserializeOwned>(
         }
     }
 
+    // Surface the miss in /metrics so operators can alert on sustained registry outages.
+    {
+        let mut stats = state.stats.write().await;
+        stats.total_evidence_fetch_failures = stats.total_evidence_fetch_failures.saturating_add(1);
+    }
+
     Err(OracleError::EvidenceNotFound(format!(
         "{} (tried {} base URL(s), up to {} retries each): {}",
         hash_hex,
@@ -101,19 +105,19 @@ async fn fetch_evidence<T: serde::de::DeserializeOwned>(
 }
 
 /// Execute the full evaluation pipeline for a single job:
-/// 1. Check eligibility on-chain
-/// 2. Fetch SLA document and delivery evidence
-/// 3. Evaluate compliance
-/// 4. Submit ConfirmOracle transaction
+/// 1. Check eligibility on-chain (using the shared RPC client and on-chain clock).
+/// 2. Fetch SLA document and delivery evidence from the evidence registry (raw-bytes hash-verified).
+/// 3. Evaluate compliance via the configured [`QualityOracle`].
+/// 4. Submit the `ConfirmOracle` transaction.
 pub async fn run_pipeline(
-    config: &OracleConfig,
+    state: &Arc<AppState>,
     job: &EvaluationJob,
 ) -> Result<PipelineOutcome, OracleError> {
     let uid_hex = hex::encode(job.payment_uid);
     info!("Pipeline started for payment {}", uid_hex);
 
     // Step 1: Verify the payment is still eligible
-    if !settler::is_eligible(config, job).await? {
+    if !settler::is_eligible(state, job).await? {
         return Err(OracleError::Evaluation(format!(
             "Payment {} is no longer eligible for oracle confirmation",
             uid_hex
@@ -121,7 +125,7 @@ pub async fn run_pipeline(
     }
 
     // Step 2: Fetch SLA document and delivery evidence
-    let sla: SlaDocument = fetch_evidence(config, &job.sla_hash, OracleError::SlaParse)
+    let sla: SlaDocument = fetch_evidence(state, &job.sla_hash, OracleError::SlaParse)
         .await
         .map_err(|e| {
             warn!("Failed to fetch SLA for {}: {}", uid_hex, e);
@@ -129,7 +133,7 @@ pub async fn run_pipeline(
         })?;
 
     let evidence: DeliveryEvidence =
-        fetch_evidence(config, &job.delivery_hash, OracleError::DeliveryParse)
+        fetch_evidence(state, &job.delivery_hash, OracleError::DeliveryParse)
             .await
             .map_err(|e| {
                 warn!("Failed to fetch delivery evidence for {}: {}", uid_hex, e);
@@ -142,7 +146,8 @@ pub async fn run_pipeline(
     );
 
     // Step 3: Evaluate
-    let result = Evaluator::evaluate(&sla, &evidence, config.strict_profile)?;
+    let oracle_impl = Evaluator::new(state.config.strict_profile);
+    let result = oracle_impl.evaluate(&sla, &evidence)?;
     let resolution_hash = settler::compute_resolution_hash(job, &sla, &result)?;
 
     let verdict = if result.approved {
@@ -164,7 +169,7 @@ pub async fn run_pipeline(
 
     // Step 4: Settle on-chain
     let sig = match settler::settle(
-        config,
+        state,
         job,
         result.approved,
         result.resolution_reason,
@@ -192,10 +197,16 @@ pub async fn run_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::API_QUALITY_V1_PROFILE_ID;
+    use crate::{
+        config::OracleConfig,
+        server::{AppState, OracleStats},
+        types::{RuntimeHealth, API_QUALITY_V1_PROFILE_ID},
+    };
     use axum::{routing::get, Router};
+    use solana_client::nonblocking::rpc_client::RpcClient;
     use solana_sdk::{pubkey::Pubkey, signature::Keypair};
-    use std::sync::Arc;
+    use std::{collections::VecDeque, sync::Arc, time::Instant};
+    use tokio::sync::RwLock;
 
     fn test_config(base_url: String) -> OracleConfig {
         OracleConfig {
@@ -218,7 +229,28 @@ mod tests {
             strict_profile: true,
             dead_letter_max_attempts: 5,
             job_channel_capacity: 16,
+            require_event_match: false,
+            backfill_lookback_signatures: 0,
         }
+    }
+
+    fn test_state(base_url: String) -> Arc<AppState> {
+        let config = test_config(base_url);
+        let rpc = Arc::new(RpcClient::new(config.solana_rpc_url.clone()));
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        Arc::new(AppState {
+            config,
+            stats: RwLock::new(OracleStats::default()),
+            health: Arc::new(RwLock::new(RuntimeHealth::default())),
+            manual_evaluate_requests: RwLock::new(VecDeque::new()),
+            db: None,
+            started_at: Instant::now(),
+            http,
+            rpc,
+        })
     }
 
     async fn spawn_registry(body: String) -> String {
@@ -250,9 +282,9 @@ mod tests {
         let digest = Sha256::digest(body.as_bytes());
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&digest);
-        let config = test_config(spawn_registry(body).await);
+        let state = test_state(spawn_registry(body).await);
 
-        let sla: SlaDocument = fetch_evidence(&config, &hash, OracleError::SlaParse)
+        let sla: SlaDocument = fetch_evidence(&state, &hash, OracleError::SlaParse)
             .await
             .unwrap();
 
@@ -262,8 +294,8 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_evidence_rejects_hash_mismatch() {
-        let config = test_config(spawn_registry("{\"version\":1}".into()).await);
-        let err = fetch_evidence::<SlaDocument>(&config, &[9u8; 32], OracleError::SlaParse)
+        let state = test_state(spawn_registry("{\"version\":1}".into()).await);
+        let err = fetch_evidence::<SlaDocument>(&state, &[9u8; 32], OracleError::SlaParse)
             .await
             .unwrap_err();
 

@@ -5,19 +5,63 @@ use crate::{
     },
 };
 
-pub struct Evaluator;
+/// Trait describing an oracle's evaluation contract.
+///
+/// Forks that want to build a domain-specific oracle on top of the rest of the oracle-qa
+/// pipeline (chain monitor, evidence fetcher, settler, Postgres ledger, operator HTTP
+/// surface) should implement this trait on their own struct and wire it into the pipeline.
+/// The profile id serves both as a machine-readable identifier for the rule family and as
+/// a guard when SLA documents declare a `profile_id` field.
+#[allow(dead_code)]
+pub trait QualityOracle: Send + Sync {
+    /// Stable profile identifier, e.g. `x402/oracle-qa/api-quality/v1`.
+    fn profile_id(&self) -> &'static str;
+
+    /// Evaluate a validated SLA document against validated delivery evidence.
+    /// Implementations should return a deterministic `EvaluationResult` whose
+    /// `resolution_reason` aligns with the `sla_escrow_api::resolution::ResolutionReason`
+    /// vocabulary so on-chain verdicts remain auditable.
+    fn evaluate(
+        &self,
+        sla: &SlaDocument,
+        evidence: &DeliveryEvidence,
+    ) -> Result<EvaluationResult, OracleError>;
+}
+
+/// Default reference evaluator: the API-quality profile v1.
+///
+/// Implements the deterministic battery of checks documented in
+/// `spec/api-quality-v1/NORMATIVE.md`. Wrap in `Arc` / keep as a short-lived value per
+/// job — it is trivially cloneable and holds no state beyond the strict-profile flag.
+#[derive(Clone, Copy)]
+pub struct Evaluator {
+    strict_profile: bool,
+}
 
 impl Evaluator {
-    /// Run all SLA compliance checks against the delivery evidence.
+    pub fn new(strict_profile: bool) -> Self {
+        Self { strict_profile }
+    }
+
+    /// Pure helper preserved for ad-hoc callers and older tests.
+    #[allow(dead_code)]
     pub fn evaluate(
         sla: &SlaDocument,
         evidence: &DeliveryEvidence,
         strict_profile: bool,
     ) -> Result<EvaluationResult, OracleError> {
+        Self { strict_profile }.evaluate_impl(sla, evidence)
+    }
+
+    fn evaluate_impl(
+        &self,
+        sla: &SlaDocument,
+        evidence: &DeliveryEvidence,
+    ) -> Result<EvaluationResult, OracleError> {
         let mut checks = Vec::new();
 
         let version_ok = sla.version == 1;
-        if strict_profile || !version_ok {
+        if self.strict_profile || !version_ok {
             checks.push(CheckResult {
                 name: "version".into(),
                 passed: version_ok,
@@ -40,7 +84,7 @@ impl Evaluator {
                     format!("expected '{}', got '{}'", API_QUALITY_V1_PROFILE_ID, pid)
                 },
             });
-        } else if strict_profile {
+        } else if self.strict_profile {
             checks.push(CheckResult {
                 name: "profile_id".into(),
                 passed: false,
@@ -160,6 +204,20 @@ impl Evaluator {
     }
 }
 
+impl QualityOracle for Evaluator {
+    fn profile_id(&self) -> &'static str {
+        API_QUALITY_V1_PROFILE_ID
+    }
+
+    fn evaluate(
+        &self,
+        sla: &SlaDocument,
+        evidence: &DeliveryEvidence,
+    ) -> Result<EvaluationResult, OracleError> {
+        self.evaluate_impl(sla, evidence)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +281,16 @@ mod tests {
         let result = Evaluator::evaluate(&valid_sla(), &valid_evidence(), true).unwrap();
 
         assert!(result.approved);
+    }
+
+    #[test]
+    fn trait_and_direct_call_match() {
+        let oracle = Evaluator::new(true);
+        let via_trait =
+            <Evaluator as QualityOracle>::evaluate(&oracle, &valid_sla(), &valid_evidence())
+                .unwrap();
+        let via_direct = Evaluator::evaluate(&valid_sla(), &valid_evidence(), true).unwrap();
+        assert_eq!(via_trait.approved, via_direct.approved);
+        assert_eq!(via_trait.resolution_reason, via_direct.resolution_reason);
     }
 }
