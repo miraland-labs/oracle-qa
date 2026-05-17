@@ -1,3 +1,19 @@
+# oracle-qa — DEPRECATED (superseded by `oracles/oracle-api-quality`)
+
+> **This project has been renamed and refactored** into the multi-category oracle workspace at [`miraland-labs/oracles`](https://github.com/miraland-labs/oracles), the standalone sibling repo to this hub.
+> 
+> - **New canonical crate:** `oracle-api-quality` in the [`oracles`](https://github.com/miraland-labs/oracles) workspace — same JSON-shaped SLA evaluator, now sharing chain-monitoring / registration / settlement / ledger code with two sibling oracles via `oracle-common`.
+> - **New canonical profile id:** `x402/oracle/api-quality/v1` (replaces `x402/oracle-qa/api-quality/v1`).
+> - **DB schema:** identical tables (`oracle_jobs`, `oracle_verdicts`, `oracle_lifecycle_events`, `oracle_parameters`) plus four new tables; run `psql "$DATABASE_URL" -f oracle-common/migrations/init.sql` from the new workspace.
+> - **Operator script paths:** `scripts/install.sh api-quality ...` in the new workspace replaces the manual `/etc/systemd/system/oracle-qa.service` recipe in `docs/DEPLOYMENT.md`.
+> - **All env vars** the old `oracle-qa` consumed are honored unchanged: `EVIDENCE_REGISTRY_URL` (singular), `EVIDENCE_REGISTRY_URLS` (mirrors), `ORACLE_OPERATOR_TOKEN_SHA256`, `X-Oracle-Token` header, `ORACLE_BACKFILL_LOOKBACK_SIGNATURES`, `ORACLE_REQUIRE_EVENT_MATCH`, `ORACLE_STRICT_PROFILE`, `ORACLE_DEAD_LETTER_MAX_ATTEMPTS`, etc.
+>
+> This directory is kept as an archive for historical reference and is **not built or tested**. It will be deleted in a subsequent cleanup.
+
+---
+
+## Original README (archived below for reference)
+
 # oracle-qa — API Response Quality Oracle
 
 The **first official oracle** for the x402 SLA-Escrow ecosystem.
